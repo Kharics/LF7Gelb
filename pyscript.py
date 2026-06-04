@@ -446,7 +446,7 @@ def main():
                 update_log_metrics(args.log_dir)
                 log_error("Fehler: %s", error)
 
-            time.sleep(2)
+            time.sleep(1)
 
     except KeyboardInterrupt:
         log_info("Programm beendet durch KeyboardInterrupt.")
