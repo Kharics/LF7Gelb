@@ -25,7 +25,7 @@ Device.pin_factory = LGPIOFactory(chip=0)
 # Prometheus
 # =========================
 
-PROMETHEUS_PORT = 8788
+PROMETHEUS_PORT = 8787
 
 
 # =========================
