@@ -16,7 +16,7 @@ from prometheus_client import start_http_server, Gauge
 # Prometheus
 # =========================
 
-PROMETHEUS_PORT = 8788
+PROMETHEUS_PORT = 8787
 
 
 # =========================
