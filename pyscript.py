@@ -8,33 +8,27 @@ import sys
 import time
 from datetime import datetime
 
+import lgpio
 from prometheus_client import start_http_server, Gauge
-
-from gpiozero import LED, DigitalInputDevice, Device
-from gpiozero.pins.lgpio import LGPIOFactory
-
-
-# =========================
-# GPIO Backend
-# =========================
-
-Device.pin_factory = LGPIOFactory(chip=0)
 
 
 # =========================
 # Prometheus
 # =========================
 
-PROMETHEUS_PORT = 8787
+PROMETHEUS_PORT = 8788
+
+
+# =========================
+# GPIO-Chip
+# =========================
+
+GPIO_CHIP = 0
 
 
 # =========================
 # GPIO-Belegung
 # =========================
-# GPIO22 = Grün
-# GPIO17 = Gelb
-# GPIO27 = Rot
-# GPIO26 = Bewegungsmelder
 
 AMPEL_GRUEN_GPIO = 22
 AMPEL_GELB_GPIO = 17
@@ -60,6 +54,7 @@ TEMP_ROT_AB = 27.0
 # =========================
 
 stop = False
+logging_enabled = False
 current_log_file = None
 last_logged_files = set()
 
@@ -141,8 +136,21 @@ last_log_write_timestamp = Gauge(
 # =========================
 
 def setup_logging(log_dir):
+    global logging_enabled
     global current_log_file
 
+    if not log_dir:
+        logging_enabled = False
+        current_log_file = None
+
+        log_files_total.set(0)
+        current_log_created_timestamp.set(0)
+        last_log_write_timestamp.set(0)
+
+        print("Logging deaktiviert: kein --log-dir angegeben.")
+        return
+
+    logging_enabled = True
     os.makedirs(log_dir, exist_ok=True)
 
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -161,23 +169,39 @@ def setup_logging(log_dir):
     current_log_created_timestamp.set(created_at)
     last_log_write_timestamp.set(created_at)
 
-    logging.info("Logging gestartet")
-    logging.info("Logdatei: %s", current_log_file)
-    logging.info("Logordner: %s", log_dir)
+    log_info("Logging gestartet")
+    log_info("Logdatei: %s", current_log_file)
+    log_info("Logordner: %s", log_dir)
 
 
 def log_info(message, *args):
-    logging.info(message, *args)
-    last_log_write_timestamp.set(time.time())
+    if logging_enabled:
+        logging.info(message, *args)
+        last_log_write_timestamp.set(time.time())
+    else:
+        if args:
+            message = message % args
+        print(message)
 
 
 def log_error(message, *args):
-    logging.error(message, *args)
-    last_log_write_timestamp.set(time.time())
+    if logging_enabled:
+        logging.error(message, *args)
+        last_log_write_timestamp.set(time.time())
+    else:
+        if args:
+            message = message % args
+        print(f"FEHLER: {message}")
 
 
 def update_log_metrics(log_dir):
     global last_logged_files
+
+    if not log_dir:
+        log_files_total.set(0)
+        current_log_created_timestamp.set(0)
+        last_log_write_timestamp.set(0)
+        return
 
     log_files = []
 
@@ -198,7 +222,6 @@ def update_log_metrics(log_dir):
         log_file_size_bytes.labels(filename=filename).set(stat.st_size)
         log_file_created_timestamp.labels(filename=filename).set(stat.st_ctime)
 
-    # Entfernt alte Labels, falls Logdateien gelöscht wurden
     removed_files = last_logged_files - current_files
 
     for filename in removed_files:
@@ -256,8 +279,26 @@ def read_temperature_celsius(path):
 
 
 # =========================
-# Ampel
+# GPIO
 # =========================
+
+def setup_gpio():
+    handle = lgpio.gpiochip_open(GPIO_CHIP)
+
+    lgpio.gpio_claim_output(handle, AMPEL_GRUEN_GPIO, 0)
+    lgpio.gpio_claim_output(handle, AMPEL_GELB_GPIO, 0)
+    lgpio.gpio_claim_output(handle, AMPEL_ROT_GPIO, 0)
+
+    lgpio.gpio_claim_input(handle, BEWEGUNG_GPIO)
+
+    return handle
+
+
+def all_lights_off(handle):
+    lgpio.gpio_write(handle, AMPEL_GRUEN_GPIO, 0)
+    lgpio.gpio_write(handle, AMPEL_GELB_GPIO, 0)
+    lgpio.gpio_write(handle, AMPEL_ROT_GPIO, 0)
+
 
 def calculate_ampel_stufe(temp_c):
     if temp_c > TEMP_ROT_AB:
@@ -268,27 +309,22 @@ def calculate_ampel_stufe(temp_c):
         return 1
 
 
-def set_ampel(stufe, green, yellow, red):
-    green.off()
-    yellow.off()
-    red.off()
+def set_ampel(handle, stufe):
+    all_lights_off(handle)
 
     if stufe == 1:
-        green.on()
+        lgpio.gpio_write(handle, AMPEL_GRUEN_GPIO, 1)
     elif stufe == 2:
-        yellow.on()
+        lgpio.gpio_write(handle, AMPEL_GELB_GPIO, 1)
     elif stufe == 3:
-        red.on()
+        lgpio.gpio_write(handle, AMPEL_ROT_GPIO, 1)
 
     ampel_stufe.set(stufe)
 
 
-# =========================
-# Bewegungsmelder
-# =========================
+def read_motion(handle):
+    raw = lgpio.gpio_read(handle, BEWEGUNG_GPIO)
 
-def read_motion(sensor):
-    raw = sensor.value
     bewegung_raw_gpio.set(raw)
 
     if BEWEGUNG_ACTIVE_HIGH:
@@ -297,7 +333,8 @@ def read_motion(sensor):
         detected = raw == 0
 
     bewegung_erkannt.set(1 if detected else 0)
-    return detected
+
+    return detected, raw
 
 
 # =========================
@@ -317,6 +354,8 @@ def update_stop(temp_c, motion_detected):
     stop_status.set(1 if stop else 0)
     stop_changed.set(1 if old_stop != stop else 0)
 
+    return temp_stop, motion_stop
+
 
 # =========================
 # Argumente
@@ -329,8 +368,15 @@ def parse_args():
 
     parser.add_argument(
         "--log-dir",
-        required=True,
-        help="Ordner, in dem Logdateien gespeichert werden sollen"
+        required=False,
+        default=None,
+        help="Optionaler Ordner fuer Logdateien. Wenn nicht gesetzt, werden keine Logs erstellt."
+    )
+
+    parser.add_argument(
+        "--motion-active-low",
+        action="store_true",
+        help="Setzt Bewegung erkannt auf LOW statt HIGH. Wichtig fuer manche Hindernissensoren."
     )
 
     return parser.parse_args()
@@ -341,26 +387,24 @@ def parse_args():
 # =========================
 
 def main():
+    global BEWEGUNG_ACTIVE_HIGH
+
     args = parse_args()
+
+    if args.motion_active_low:
+        BEWEGUNG_ACTIVE_HIGH = False
 
     setup_logging(args.log_dir)
 
     log_info("Starte Prometheus Exporter auf Port %s", PROMETHEUS_PORT)
+    log_info("Bewegung aktiv bei: %s", "HIGH" if BEWEGUNG_ACTIVE_HIGH else "LOW")
+
     start_http_server(PROMETHEUS_PORT)
 
     temperature_file = find_temperature_file()
     log_info("Temperaturdatei gefunden: %s", temperature_file)
 
-    green = LED(AMPEL_GRUEN_GPIO)
-    yellow = LED(AMPEL_GELB_GPIO)
-    red = LED(AMPEL_ROT_GPIO)
-
-    motion_sensor = DigitalInputDevice(
-        BEWEGUNG_GPIO,
-        pull_up=None,
-        active_state=True,
-        bounce_time=0.05
-    )
+    handle = setup_gpio()
 
     log_info("GPIO-Belegung:")
     log_info("  Ampel Gruen: GPIO%s", AMPEL_GRUEN_GPIO)
@@ -376,22 +420,24 @@ def main():
                 temperature_celsius.set(temp_c)
                 temperature_read_success.set(1)
 
-                motion_detected = read_motion(motion_sensor)
+                motion_detected, motion_raw = read_motion(handle)
 
                 stufe = calculate_ampel_stufe(temp_c)
-                set_ampel(stufe, green, yellow, red)
+                set_ampel(handle, stufe)
 
-                update_stop(temp_c, motion_detected)
+                temp_stop, motion_stop = update_stop(temp_c, motion_detected)
 
                 last_update_timestamp.set(time.time())
-
                 update_log_metrics(args.log_dir)
 
                 log_info(
-                    "Temp=%.3f C | Ampel=%s | Bewegung=%s | Stop=%s",
+                    "Temp=%.3f C | Ampel=%s | BewegungRaw=%s | BewegungDetected=%s | TempStop=%s | MotionStop=%s | Stop=%s",
                     temp_c,
                     stufe,
+                    motion_raw,
                     motion_detected,
+                    temp_stop,
+                    motion_stop,
                     stop
                 )
 
@@ -406,18 +452,10 @@ def main():
         log_info("Programm beendet durch KeyboardInterrupt.")
 
     finally:
-        green.off()
-        yellow.off()
-        red.off()
-
-        green.close()
-        yellow.close()
-        red.close()
-        motion_sensor.close()
-
+        all_lights_off(handle)
+        lgpio.gpiochip_close(handle)
         log_info("GPIO geschlossen. Programm beendet.")
 
 
 if __name__ == "__main__":
     main()
-
