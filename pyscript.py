@@ -4,6 +4,8 @@ import argparse
 import glob
 import logging
 import os
+import shutil
+import subprocess
 import sys
 import time
 from datetime import datetime
@@ -12,56 +14,49 @@ import lgpio
 from prometheus_client import start_http_server, Gauge
 
 
-# =========================
-# Prometheus
-# =========================
+# ============================================================
+# Konfiguration
+# ============================================================
 
 PROMETHEUS_PORT = 8787
-
-
-# =========================
-# GPIO-Chip
-# =========================
-
 GPIO_CHIP = 0
 
-
-# =========================
 # GPIO-Belegung
-# =========================
-
 AMPEL_GRUEN_GPIO = 22
 AMPEL_GELB_GPIO = 17
 AMPEL_ROT_GPIO = 27
-
 BEWEGUNG_GPIO = 26
 
-# True  = GPIO HIGH bedeutet Bewegung erkannt
-# False = GPIO LOW bedeutet Bewegung erkannt
-BEWEGUNG_ACTIVE_HIGH = True
-
-
-# =========================
 # Temperaturgrenzen
-# =========================
-
 TEMP_GELB_AB = 25.0
 TEMP_ROT_AB = 27.0
 
+# Messintervall Sensoren
+INTERVAL_SECONDS = 2
 
-# =========================
+# Standardordner
+DEFAULT_LOG_DIR = "logs"
+DEFAULT_AUFNAHME_DIR = "aufnahmen"
+
+# Kamera
+DEFAULT_CAPTURE_INTERVAL_SECONDS = 30
+
+
+# ============================================================
 # Globale Variablen
-# =========================
+# ============================================================
 
 stop = False
 logging_enabled = False
 current_log_file = None
 last_logged_files = set()
+last_capture_time = 0
+camera_command = None
 
 
-# =========================
-# Prometheus-Metriken
-# =========================
+# ============================================================
+# Prometheus Metriken
+# ============================================================
 
 temperature_celsius = Gauge(
     "projekt_temperature_celsius",
@@ -130,25 +125,97 @@ last_log_write_timestamp = Gauge(
     "Unix-Zeitstempel des letzten Logeintrags"
 )
 
+kamera_aufnahme_success = Gauge(
+    "projekt_kamera_aufnahme_success",
+    "Letzte Kameraaufnahme erfolgreich: 1=ja, 0=nein"
+)
 
-# =========================
+kamera_aufnahme_total = Gauge(
+    "projekt_kamera_aufnahme_total",
+    "Anzahl erfolgreicher Kameraaufnahmen seit Programmstart"
+)
+
+kamera_last_capture_timestamp = Gauge(
+    "projekt_kamera_last_capture_timestamp_seconds",
+    "Unix-Zeitstempel der letzten erfolgreichen Kameraaufnahme"
+)
+
+kamera_last_file_size_bytes = Gauge(
+    "projekt_kamera_last_file_size_bytes",
+    "Dateigroesse der letzten Kameraaufnahme in Bytes"
+)
+
+kamera_aufnahme_files_total = Gauge(
+    "projekt_kamera_aufnahme_files_total",
+    "Anzahl der Bilddateien im Aufnahmeordner"
+)
+
+
+# ============================================================
+# Argumente
+# ============================================================
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Raspberry Pi Sensor Exporter fuer Prometheus/Grafana mit Kamera"
+    )
+
+    parser.add_argument(
+        "--log-dir",
+        required=False,
+        default=DEFAULT_LOG_DIR,
+        help="Ordner fuer Logdateien. Standard: logs"
+    )
+
+    parser.add_argument(
+        "--aufnahme-dir",
+        required=False,
+        default=DEFAULT_AUFNAHME_DIR,
+        help="Ordner fuer Kameraaufnahmen. Standard: aufnahmen"
+    )
+
+    parser.add_argument(
+        "--capture-interval",
+        required=False,
+        type=int,
+        default=DEFAULT_CAPTURE_INTERVAL_SECONDS,
+        help="Intervall fuer Kameraaufnahmen in Sekunden. Standard: 30"
+    )
+
+    parser.add_argument(
+        "--disable-camera",
+        action="store_true",
+        help="Deaktiviert Kameraaufnahmen."
+    )
+
+    parser.add_argument(
+        "--motion-active-low",
+        action="store_true",
+        help="Bewegung wird erkannt, wenn GPIO26 LOW ist."
+    )
+
+    parser.add_argument(
+        "--motion-pull-up",
+        action="store_true",
+        help="Aktiviert internen Pull-Up fuer GPIO26."
+    )
+
+    parser.add_argument(
+        "--motion-pull-down",
+        action="store_true",
+        help="Aktiviert internen Pull-Down fuer GPIO26."
+    )
+
+    return parser.parse_args()
+
+
+# ============================================================
 # Logging
-# =========================
+# ============================================================
 
 def setup_logging(log_dir):
     global logging_enabled
     global current_log_file
-
-    if not log_dir:
-        logging_enabled = False
-        current_log_file = None
-
-        log_files_total.set(0)
-        current_log_created_timestamp.set(0)
-        last_log_write_timestamp.set(0)
-
-        print("Logging deaktiviert: kein --log-dir angegeben.")
-        return
 
     logging_enabled = True
     os.makedirs(log_dir, exist_ok=True)
@@ -197,17 +264,15 @@ def log_error(message, *args):
 def update_log_metrics(log_dir):
     global last_logged_files
 
-    if not log_dir:
-        log_files_total.set(0)
-        current_log_created_timestamp.set(0)
-        last_log_write_timestamp.set(0)
-        return
-
     log_files = []
 
-    for entry in os.scandir(log_dir):
-        if entry.is_file() and entry.name.endswith(".log"):
-            log_files.append(entry)
+    try:
+        for entry in os.scandir(log_dir):
+            if entry.is_file() and entry.name.endswith(".log"):
+                log_files.append(entry)
+    except FileNotFoundError:
+        log_files_total.set(0)
+        return
 
     log_files_total.set(len(log_files))
 
@@ -234,9 +299,9 @@ def update_log_metrics(log_dir):
     last_logged_files = current_files
 
 
-# =========================
+# ============================================================
 # Temperatur lesen
-# =========================
+# ============================================================
 
 def find_temperature_file():
     possible_patterns = [
@@ -278,18 +343,28 @@ def read_temperature_celsius(path):
     return value
 
 
-# =========================
-# GPIO
-# =========================
+# ============================================================
+# GPIO Setup
+# ============================================================
 
-def setup_gpio():
+def setup_gpio(motion_pull_up=False, motion_pull_down=False):
     handle = lgpio.gpiochip_open(GPIO_CHIP)
 
-    lgpio.gpio_claim_output(handle, AMPEL_GRUEN_GPIO, 0)
-    lgpio.gpio_claim_output(handle, AMPEL_GELB_GPIO, 0)
-    lgpio.gpio_claim_output(handle, AMPEL_ROT_GPIO, 0)
+    lgpio.gpio_claim_output(handle, AMPEL_GRUEN_GPIO, 0, 0)
+    lgpio.gpio_claim_output(handle, AMPEL_GELB_GPIO, 0, 0)
+    lgpio.gpio_claim_output(handle, AMPEL_ROT_GPIO, 0, 0)
 
-    lgpio.gpio_claim_input(handle, BEWEGUNG_GPIO)
+    flags = 0
+
+    if motion_pull_up and motion_pull_down:
+        raise ValueError("Nutze entweder --motion-pull-up oder --motion-pull-down, nicht beide gleichzeitig.")
+
+    if motion_pull_up:
+        flags = lgpio.SET_PULL_UP
+    elif motion_pull_down:
+        flags = lgpio.SET_PULL_DOWN
+
+    lgpio.gpio_claim_input(handle, BEWEGUNG_GPIO, flags)
 
     return handle
 
@@ -299,6 +374,10 @@ def all_lights_off(handle):
     lgpio.gpio_write(handle, AMPEL_GELB_GPIO, 0)
     lgpio.gpio_write(handle, AMPEL_ROT_GPIO, 0)
 
+
+# ============================================================
+# Ampel
+# ============================================================
 
 def calculate_ampel_stufe(temp_c):
     if temp_c > TEMP_ROT_AB:
@@ -322,24 +401,28 @@ def set_ampel(handle, stufe):
     ampel_stufe.set(stufe)
 
 
-def read_motion(handle):
+# ============================================================
+# Bewegungsmelder
+# ============================================================
+
+def read_motion(handle, motion_active_low):
     raw = lgpio.gpio_read(handle, BEWEGUNG_GPIO)
 
     bewegung_raw_gpio.set(raw)
 
-    if BEWEGUNG_ACTIVE_HIGH:
-        detected = raw == 1
-    else:
+    if motion_active_low:
         detected = raw == 0
+    else:
+        detected = raw == 1
 
     bewegung_erkannt.set(1 if detected else 0)
 
     return detected, raw
 
 
-# =========================
+# ============================================================
 # Stop-Logik
-# =========================
+# ============================================================
 
 def update_stop(temp_c, motion_detected):
     global stop
@@ -357,61 +440,173 @@ def update_stop(temp_c, motion_detected):
     return temp_stop, motion_stop
 
 
-# =========================
-# Argumente
-# =========================
+# ============================================================
+# Kamera
+# ============================================================
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Raspberry Pi Sensor Exporter fuer Prometheus/Grafana"
-    )
+def find_camera_command():
+    if shutil.which("rpicam-still"):
+        return "rpicam-still"
 
-    parser.add_argument(
-        "--log-dir",
-        required=False,
-        default=None,
-        help="Optionaler Ordner fuer Logdateien. Wenn nicht gesetzt, werden keine Logs erstellt."
-    )
+    if shutil.which("libcamera-still"):
+        return "libcamera-still"
 
-    parser.add_argument(
-        "--motion-active-low",
-        action="store_true",
-        help="Setzt Bewegung erkannt auf LOW statt HIGH. Wichtig fuer manche Hindernissensoren."
-    )
-
-    return parser.parse_args()
+    return None
 
 
-# =========================
+def setup_camera(aufnahme_dir, camera_disabled):
+    global camera_command
+
+    os.makedirs(aufnahme_dir, exist_ok=True)
+
+    if camera_disabled:
+        camera_command = None
+        kamera_aufnahme_success.set(0)
+        log_info("Kamera deaktiviert durch --disable-camera")
+        return
+
+    camera_command = find_camera_command()
+
+    if camera_command is None:
+        kamera_aufnahme_success.set(0)
+        log_error("Kein Kamera-Befehl gefunden. Erwartet: rpicam-still oder libcamera-still")
+        return
+
+    log_info("Kamera-Befehl gefunden: %s", camera_command)
+    log_info("Aufnahmeordner: %s", aufnahme_dir)
+
+
+def update_aufnahme_metrics(aufnahme_dir):
+    count = 0
+
+    try:
+        for entry in os.scandir(aufnahme_dir):
+            if entry.is_file() and entry.name.lower().endswith((".jpg", ".jpeg", ".png")):
+                count += 1
+    except FileNotFoundError:
+        count = 0
+
+    kamera_aufnahme_files_total.set(count)
+
+
+def capture_image_if_due(aufnahme_dir, capture_interval):
+    global last_capture_time
+
+    if camera_command is None:
+        update_aufnahme_metrics(aufnahme_dir)
+        return None
+
+    now = time.time()
+
+    if now - last_capture_time < capture_interval:
+        update_aufnahme_metrics(aufnahme_dir)
+        return None
+
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    image_path = os.path.join(aufnahme_dir, f"aufnahme_{timestamp}.jpg")
+
+    command = [
+        camera_command,
+        "-o",
+        image_path,
+        "--nopreview",
+        "-t",
+        "1000"
+    ]
+
+    try:
+        result = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=15
+        )
+
+        if result.returncode != 0:
+            kamera_aufnahme_success.set(0)
+            log_error("Kameraaufnahme fehlgeschlagen: %s", result.stderr.strip())
+            update_aufnahme_metrics(aufnahme_dir)
+            return None
+
+        if not os.path.isfile(image_path):
+            kamera_aufnahme_success.set(0)
+            log_error("Kameraaufnahme fehlgeschlagen: Datei wurde nicht erstellt: %s", image_path)
+            update_aufnahme_metrics(aufnahme_dir)
+            return None
+
+        file_size = os.path.getsize(image_path)
+
+        last_capture_time = now
+        kamera_aufnahme_success.set(1)
+        kamera_aufnahme_total.inc()
+        kamera_last_capture_timestamp.set(now)
+        kamera_last_file_size_bytes.set(file_size)
+
+        update_aufnahme_metrics(aufnahme_dir)
+
+        log_info("Kameraaufnahme gespeichert: %s | Groesse=%s Bytes", image_path, file_size)
+        return image_path
+
+    except subprocess.TimeoutExpired:
+        kamera_aufnahme_success.set(0)
+        log_error("Kameraaufnahme Timeout nach 15 Sekunden")
+        update_aufnahme_metrics(aufnahme_dir)
+        return None
+
+    except Exception as error:
+        kamera_aufnahme_success.set(0)
+        log_error("Kameraaufnahme Fehler: %s", error)
+        update_aufnahme_metrics(aufnahme_dir)
+        return None
+
+
+# ============================================================
 # Main
-# =========================
+# ============================================================
 
 def main():
-    global BEWEGUNG_ACTIVE_HIGH
-
     args = parse_args()
-
-    if args.motion_active_low:
-        BEWEGUNG_ACTIVE_HIGH = False
 
     setup_logging(args.log_dir)
 
     log_info("Starte Prometheus Exporter auf Port %s", PROMETHEUS_PORT)
-    log_info("Bewegung aktiv bei: %s", "HIGH" if BEWEGUNG_ACTIVE_HIGH else "LOW")
+    log_info("Messintervall Sensoren: %s Sekunden", INTERVAL_SECONDS)
+    log_info("Kamera-Aufnahmeintervall: %s Sekunden", args.capture_interval)
+    log_info("Logordner: %s", args.log_dir)
+    log_info("Aufnahmeordner: %s", args.aufnahme_dir)
+
+    log_info("Bewegungsmelder GPIO: GPIO%s", BEWEGUNG_GPIO)
+    log_info("Bewegung aktiv bei: %s", "LOW" if args.motion_active_low else "HIGH")
+
+    if args.motion_pull_up:
+        log_info("GPIO26 Pull-Modus: Pull-Up")
+    elif args.motion_pull_down:
+        log_info("GPIO26 Pull-Modus: Pull-Down")
+    else:
+        log_info("GPIO26 Pull-Modus: Kein interner Pull")
 
     start_http_server(PROMETHEUS_PORT)
+    log_info("Metrics erreichbar unter: http://localhost:%s/metrics", PROMETHEUS_PORT)
 
     temperature_file = find_temperature_file()
     log_info("Temperaturdatei gefunden: %s", temperature_file)
 
-    handle = setup_gpio()
+    handle = setup_gpio(
+        motion_pull_up=args.motion_pull_up,
+        motion_pull_down=args.motion_pull_down
+    )
+
+    setup_camera(
+        aufnahme_dir=args.aufnahme_dir,
+        camera_disabled=args.disable_camera
+    )
 
     log_info("GPIO-Belegung:")
     log_info("  Ampel Gruen: GPIO%s", AMPEL_GRUEN_GPIO)
     log_info("  Ampel Gelb : GPIO%s", AMPEL_GELB_GPIO)
     log_info("  Ampel Rot  : GPIO%s", AMPEL_ROT_GPIO)
     log_info("  Bewegung   : GPIO%s", BEWEGUNG_GPIO)
-    log_info("Metrics: http://localhost:%s/metrics", PROMETHEUS_PORT)
 
     try:
         while True:
@@ -420,14 +615,24 @@ def main():
                 temperature_celsius.set(temp_c)
                 temperature_read_success.set(1)
 
-                motion_detected, motion_raw = read_motion(handle)
+                motion_detected, motion_raw = read_motion(
+                    handle,
+                    motion_active_low=args.motion_active_low
+                )
 
                 stufe = calculate_ampel_stufe(temp_c)
                 set_ampel(handle, stufe)
 
                 temp_stop, motion_stop = update_stop(temp_c, motion_detected)
 
-                last_update_timestamp.set(time.time())
+                capture_image_if_due(
+                    aufnahme_dir=args.aufnahme_dir,
+                    capture_interval=args.capture_interval
+                )
+
+                now = time.time()
+                last_update_timestamp.set(now)
+
                 update_log_metrics(args.log_dir)
 
                 log_info(
@@ -444,17 +649,23 @@ def main():
             except Exception as error:
                 temperature_read_success.set(0)
                 update_log_metrics(args.log_dir)
-                log_error("Fehler: %s", error)
+                update_aufnahme_metrics(args.aufnahme_dir)
+                log_error("Fehler im Messzyklus: %s", error)
 
-            time.sleep(1)
+            time.sleep(INTERVAL_SECONDS)
 
     except KeyboardInterrupt:
         log_info("Programm beendet durch KeyboardInterrupt.")
 
     finally:
-        all_lights_off(handle)
-        lgpio.gpiochip_close(handle)
-        log_info("GPIO geschlossen. Programm beendet.")
+        try:
+            all_lights_off(handle)
+            lgpio.gpiochip_close(handle)
+            log_info("GPIO geschlossen. Ampel ausgeschaltet.")
+        except Exception as error:
+            log_error("Fehler beim GPIO-Cleanup: %s", error)
+
+        log_info("Programm beendet.")
 
 
 if __name__ == "__main__":
